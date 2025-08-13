@@ -1,0 +1,338 @@
+#include "common.cginc"
+void IntersectBVHShadow(int ray_index, int threadIdxy, int GTx) {
+    #ifdef HardwareRT
+        if(ray_index >= BufferSizes[CurBounce].shadow_rays) return;
+    #endif
+    SmallerRay ray;
+
+    #ifndef HardwareRT
+        uint2 stack[16];
+        int stack_size = 0;
+        uint2 current_group;
+        int NodeOffset;
+        int TriOffset;
+        int MatOffset;
+        uint oct_inv4;
+        int tlas_stack_size;
+        SmallerRay ray2;
+        int Reps = 0;
+        bool Hit = false;
+    #endif
+
+        int mesh_id = -1;
+
+        ShadowRayData ShadowRay;
+        float3 throughput = 1;
+
+        #ifdef HardwareRT
+            const uint rayFlags = RAY_FLAG_CULL_NON_OPAQUE;
+            RayQuery<rayFlags> q;
+            RayDesc myRay;
+            ShadowRay = ShadowRaysBuffer[ray_index];
+            myRay.Origin = ShadowRaysBuffer[ray_index].origin;
+            float ShadowRayT = length(ShadowRaysBuffer[ray_index].EndPoint - myRay.Origin);
+            myRay.Direction = normalize(ShadowRaysBuffer[ray_index].EndPoint - myRay.Origin);
+            ray.origin = myRay.Origin;
+            ray.direction = myRay.Direction;
+            myRay.TMin = 0;
+            myRay.TMax = ShadowRayT;
+            while(true) {
+                q.TraceRayInline(myAccelerationStructure, rayFlags, 0xff, myRay);
+                while(q.Proceed()){}
+
+                if(q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+
+                    float u = q.CommittedTriangleBarycentrics().y;
+                    float v = q.CommittedTriangleBarycentrics().x;
+                    int2 Indexes = int2(q.CommittedInstanceID(), q.CommittedGeometryIndex());
+                    int triangle_id = q.CommittedPrimitiveIndex();
+                    #if defined(IgnoreBackfacing) || defined(AdvancedAlphaMapped) || defined(IgnoreGlassShadow) || defined(AdvancedBackground)
+                        int triangleOffset = SubMeshOffsets[MeshOffsets[Indexes.x].x + Indexes.y];
+                        triangle_id += triangleOffset;
+                        mesh_id = MeshOffsets[Indexes.x].y;
+                        int MaterialIndex = (_MeshData[mesh_id].MaterialOffset + AggTrisA[triangle_id].MatDat);
+                        if(GetFlag(_IntersectionMaterials[MaterialIndex].Tag, IsBackground) || GetFlag(_IntersectionMaterials[MaterialIndex].Tag, ShadowCaster))  {myRay.TMin = q.CommittedRayT() + 0.0001f; continue;} 
+                    #endif
+                    #ifdef AdvancedAlphaMapped
+                        if(_IntersectionMaterials[MaterialIndex].MatType == CutoutIndex) {
+                            float2 BaseUv = TOHALF(AggTrisA[triangle_id].tex0) * (1.0f - u - v) + TOHALF(AggTrisA[triangle_id].texedge1) * u + TOHALF(AggTrisA[triangle_id].texedge2) * v;
+                            if(_IntersectionMaterials[MaterialIndex].AlphaTex.x > 0) {
+                                float Alph = SampleTexture(BaseUv, SampleAlpha, _IntersectionMaterials[MaterialIndex]).x;
+                                if((GetFlag(_IntersectionMaterials[MaterialIndex].Tag, InvertAlpha) ? (1.0f - Alph) : Alph) < _IntersectionMaterials[MaterialIndex].AlphaCutoff) {myRay.TMin = q.CommittedRayT() + 0.0001f; continue;}
+                            }
+                        }
+                    #endif
+                    #ifdef IgnoreBackfacing
+                        TrianglePos tri = triangle_get_positions(triangle_id);
+                        if(_IntersectionMaterials[MaterialIndex].specTrans != 1 && dot(normalize(cross(normalize(tri.posedge1), normalize(tri.posedge2))), mul((float3x3)_MeshData[mesh_id].W2L, ray.direction)) <= 0) {myRay.TMin = q.CommittedRayT() + 0.0001f; continue;}
+                    #endif
+                    #ifdef IgnoreGlassShadow
+                        if(_IntersectionMaterials[MaterialIndex].specTrans == 1) {
+                            #ifdef StainedGlassShadows
+                                float2 BaseUv = TOHALF(AggTrisA[triangle_id].tex0) * (1.0f - u - v) + TOHALF(AggTrisA[triangle_id].texedge1) * u + TOHALF(AggTrisA[triangle_id].texedge2) * v;
+                                float3 MatCol = _IntersectionMaterials[MaterialIndex].surfaceColor;
+                                if(_IntersectionMaterials[MaterialIndex].AlbedoTex.x > 0) MatCol *= SampleTexture(BaseUv, SampleAlbedo, _IntersectionMaterials[MaterialIndex]) / 3.0f;
+                                // MatCol = lerp(MatCol, _IntersectionMaterials[MaterialIndex].BlendColor, _IntersectionMaterials[MaterialIndex].BlendFactor);
+                                throughput *= sqrt(exp(-CalculateExtinction2(1.0f - MatCol, _IntersectionMaterials[MaterialIndex].scatterDistance == 0.0f ? 1.0f : _IntersectionMaterials[MaterialIndex].scatterDistance)));
+                            #endif
+                            myRay.TMin = q.CommittedRayT() + 0.0001f; 
+                            continue;
+                        }
+                    #endif
+
+                    ShadowRaysBuffer[ray_index].FIELD = -2;//WHY
+                } else {
+                    if(!TerrainExists) {
+                        uint PixelIndex = ShadowRay.PixelIndex & 0xFFFFFFF;
+                        bool IsNotPrimaryNEERay = (ShadowRay.PixelIndex >> 30);
+                        if(CurBounce == 0) NEEPosA[uint2(PixelIndex % screen_width, PixelIndex / screen_width)] = float4(ray.origin + ray.direction * ShadowRayT,asfloat(ShadowRay.FIELD));
+                        #ifdef RadCache
+                            CacheBuffer[PixelIndex].RunningIlluminance = packRGBE(unpackRGBE(ShadowRay.DiffuseIlluminance) * throughput + unpackRGBE(CacheBuffer[PixelIndex].RunningIlluminance));
+                            AddHitToCachePartial(CacheBuffer[PixelIndex], ray.origin);
+                        #endif
+                        if (IsNotPrimaryNEERay) {
+
+                            if (CurBounce == 0) {
+                                #ifdef RadCache
+                                    GlobalColors[PixelIndex].PrimaryNEERay = packRGBE(pow(unpackRGBE(GlobalColors[PixelIndex].PrimaryNEERay),2.2f) + pow(ShadowRay.illumination,rcp(2.2f)) * throughput);
+                                #else
+                                    GlobalColors[PixelIndex].Direct += ShadowRay.illumination * throughput;
+                                #endif
+                            } else {
+                                #ifdef RadCache
+                                    if(GetBounceData(CacheBuffer[PixelIndex].pathLength) == 0) GlobalColors[PixelIndex].Indirect += ShadowRay.illumination * throughput;
+                                #else
+                                    GlobalColors[PixelIndex].Indirect += ShadowRay.illumination * throughput;
+                                #endif
+                            }
+                        } else {
+                            if(CurBounce != 0 && ((!UseReSTIRGI && GetBounceData(GlobalColors[PixelIndex].MetRoughIsSpec) == 0) || !UseASVGF)) GlobalColors[PixelIndex].Indirect += ShadowRay.illumination * throughput;// * unpackRGBE(asuint(ShadowRay.DiffuseIlluminance));
+                            else GlobalColors[PixelIndex].PrimaryNEERay = packRGBE(pow(unpackRGBE(GlobalColors[PixelIndex].PrimaryNEERay),2.2f) + pow(ShadowRay.illumination,rcp(2.2f)) * throughput);
+                        }
+                    } else {
+                        ShadowRaysBuffer[ray_index].illumination *= throughput;
+                        ShadowRaysBuffer[ray_index].DiffuseIlluminance = packRGBE(unpackRGBE(ShadowRaysBuffer[ray_index].DiffuseIlluminance) * throughput);
+                    }
+                }
+                break;
+            }
+        #else
+
+
+            current_group.x = (uint)0;
+            current_group.y = 0;//(uint)0x80000000;
+            uint2 triangle_group = 0;
+#ifndef DX11
+            if(ray_index == 0) {
+                nextRayArray[threadIdxy] = BufferSizes[CurBounce].TracedRaysShadow;
+            }
+            GroupMemoryBarrier();
+            bool KilledNaturally = true;
+#endif
+            int rayidx = 0;
+            const static int A = BufferSizes[CurBounce].shadow_rays;
+            float max_distance;
+#ifndef DX11
+    int Coun2 = 0;
+        [loop]do{
+            Coun2++;
+            Reps = 0;
+            bool                terminated = KilledNaturally;//(stack_size == 0 && current_group.y <= 0x00FFFFFF && triangle_group.y == 0);
+            const uint  maskTerminated = WaveActiveBallot(terminated);
+            const int           numTerminated = countbits(maskTerminated);
+            const int           idxTerminated = countbits(maskTerminated & ((1u << GTx) - 1));
+            KilledNaturally = false;
+            if(terminated) {
+                current_group.y = 0b10000000000000000000000000000000;//(uint)0x80000000;
+#else
+                current_group.y = (uint)0x80000000;
+#endif
+                current_group.x = (uint)0;
+                triangle_group = 0;
+#ifndef DX11
+                if(idxTerminated == 0) {
+                    InterlockedAdd(BufferSizes[CurBounce].TracedRaysShadow, numTerminated, nextRayArray[threadIdxy]);
+                }
+                GroupMemoryBarrier();
+                rayidx = nextRayArray[threadIdxy] + idxTerminated;
+                if(rayidx >= A) break;
+#else
+                rayidx = ray_index;
+                if(rayidx >= A) return;
+#endif
+                ShadowRay = ShadowRaysBuffer[rayidx];
+
+                max_distance = length(ShadowRaysBuffer[rayidx].EndPoint - ShadowRay.origin);
+                ray.origin = ShadowRay.origin;
+                ray.direction = normalize(ShadowRaysBuffer[rayidx].EndPoint - ShadowRay.origin);
+                ray.direction = (ray.direction == 0 ? EPSILON : ray.direction);
+                ray2 = ray;
+                TriOffset = 0;
+                MatOffset = 0;
+                Reps = 0;
+                NodeOffset = 0;
+                throughput = 1;
+                Hit = false;
+                stack_size = 0;
+                mesh_id = -1;
+
+                oct_inv4 = ray_get_octant_inv4(ray.direction);
+
+                current_group.x = (uint)0;
+                current_group.y = (uint)0x80000000;
+                tlas_stack_size = -1;
+#ifndef DX11
+            }
+                int lostLoopIterations = 0;
+#endif
+                [loop] while (Reps < MaxTraversalSamples) {//Traverse Accelleration Structure(Compressed Wide Bounding Volume Hierarchy)            
+                    [branch]if (current_group.y & 0xff000000) {
+                       uint child_index_offset = firstbithigh(current_group.y);
+
+                        uint slot_index = (child_index_offset - 24) ^ (oct_inv4 & 0xff);
+                        uint relative_index = countbits(current_group.y & ~(0xffffffff << slot_index));
+                        uint child_node_index = current_group.x + relative_index;
+                        const BVHNode8Data TempNode = cwbvh_nodes[child_node_index];
+
+                        current_group.y &= ~(1 << child_index_offset);
+
+                        if (current_group.y & 0xff000000) stack[stack_size++] = current_group;
+
+                        current_group.x = (TempNode.nodes[1].x) + NodeOffset;
+                        triangle_group.x = (TempNode.nodes[1].y) + TriOffset;
+
+                        uint hitmask = cwbvh_node_intersect(ray, oct_inv4, max_distance, TempNode);
+
+                        current_group.y = (hitmask & 0xff000000) | ((TempNode.nodes[0].w >> 24) & 0xff);
+                        triangle_group.y = (hitmask & 0x00ffffff);
+
+
+                        Reps++;
+                    } else {
+                        triangle_group = current_group;
+                        current_group = (uint)0;
+                    }
+
+
+                    if(triangle_group.y != 0) {
+                        [branch]if (tlas_stack_size == -1) {//Transfer from Top Level Accelleration Structure to Bottom Level Accelleration Structure
+                            uint mesh_offset = firstbithigh(triangle_group.y);
+                            triangle_group.y &= ~(1 << mesh_offset);
+
+                            mesh_id = TLASBVH8Indices[triangle_group.x + mesh_offset];
+                            NodeOffset = _MeshData[mesh_id].NodeOffset;
+                            TriOffset = _MeshData[mesh_id].TriOffset;
+
+                            if (triangle_group.y != 0) stack[stack_size++] = triangle_group;
+
+                            if (current_group.y & 0xff000000) stack[stack_size++] = current_group;
+
+                            tlas_stack_size = stack_size;
+
+                            int root_index = (_MeshData[mesh_id].mesh_data_bvh_offsets & 0x7fffffff);
+
+                            MatOffset = _MeshData[mesh_id].MaterialOffset;
+                            ray.direction = (mul((float3x3)_MeshData[mesh_id].W2L, ray.direction)).xyz;
+                            ray.origin = (mul(_MeshData[mesh_id].W2L, float4(ray.origin, 1))).xyz;
+
+                            oct_inv4 = ray_get_octant_inv4(ray.direction);
+
+                            current_group.x = (uint)root_index;
+                            current_group.y = (uint)0x80000000;
+                        } else {
+                            while (triangle_group.y != 0) {    
+                                uint triangle_index = firstbithigh(triangle_group.y);
+                                triangle_group.y &= ~(1 << triangle_index);
+
+                                if (triangle_intersect_shadow(triangle_group.x + triangle_index, ray, max_distance, throughput, MatOffset)) {
+                                    ShadowRaysBuffer[rayidx].FIELD = -2;//WHY
+#ifndef DX11
+                                    KilledNaturally = true;
+                                    break;
+#else
+                                    return;
+#endif
+                                }
+                            }
+                        }
+                    }
+#ifndef DX11
+                    if(KilledNaturally) break;
+#endif
+
+
+                    if ((current_group.y & 0xff000000) == 0) {
+                        if (stack_size == 0) {//thread has finished traversing
+                            if(!TerrainExists) {
+                                uint PixelIndex = ShadowRay.PixelIndex & 0xFFFFFFF;
+                                bool IsNotPrimaryNEERay = (ShadowRay.PixelIndex >> 30);
+                                if(CurBounce == 0) NEEPosA[uint2(PixelIndex % screen_width, PixelIndex / screen_width)] = float4(ray2.origin + ray2.direction * max_distance, asfloat(ShadowRay.FIELD));
+                                #ifdef RadCache
+                                    CacheBuffer[PixelIndex].RunningIlluminance = packRGBE(unpackRGBE(ShadowRay.DiffuseIlluminance) * throughput + unpackRGBE(CacheBuffer[PixelIndex].RunningIlluminance));
+                                    AddHitToCachePartial(CacheBuffer[PixelIndex], ray2.origin);
+                                #endif
+                                if (IsNotPrimaryNEERay) {
+                                    if (CurBounce == 0) {
+                                        #ifdef RadCache
+                                            GlobalColors[PixelIndex].PrimaryNEERay = packRGBE(pow(unpackRGBE(GlobalColors[PixelIndex].PrimaryNEERay),2.2f) + pow(ShadowRay.illumination,rcp(2.2f)) * throughput);
+                                        #else
+                                            GlobalColors[PixelIndex].Direct += ShadowRay.illumination * throughput;
+                                        #endif
+                                    } else {
+                                        #ifdef RadCache
+                                            if(GetBounceData(CacheBuffer[PixelIndex].pathLength) == 0) GlobalColors[PixelIndex].Indirect += ShadowRay.illumination * throughput;
+                                        #else
+                                            GlobalColors[PixelIndex].Indirect += ShadowRay.illumination * throughput;
+                                        #endif
+                                    }
+                                } else {
+                                    if(CurBounce != 0 && ((!UseReSTIRGI && GetBounceData(GlobalColors[PixelIndex].MetRoughIsSpec) == 0) || !UseASVGF)) GlobalColors[PixelIndex].Indirect += ShadowRay.illumination * throughput;// * unpackRGBE(asuint(ShadowRay.DiffuseIlluminance));
+                                    else GlobalColors[PixelIndex].PrimaryNEERay = packRGBE(pow(unpackRGBE(GlobalColors[PixelIndex].PrimaryNEERay),2.2f) + pow(ShadowRay.illumination,rcp(2.2f)) * throughput);
+                                }
+                            } else {
+                                ShadowRaysBuffer[rayidx].illumination *= throughput;
+                                ShadowRaysBuffer[rayidx].DiffuseIlluminance = packRGBE(unpackRGBE(ShadowRaysBuffer[rayidx].DiffuseIlluminance) * throughput);
+                            }
+#ifndef DX11
+                            KilledNaturally = true;
+                            break;
+#else
+                            return;
+#endif
+                        }
+
+                        if (stack_size == tlas_stack_size) {
+                            NodeOffset = 0;
+                            TriOffset = 0;
+                            tlas_stack_size = -1;
+                            ray = ray2;
+                            oct_inv4 = ray_get_octant_inv4(ray.direction);
+                        }
+                        current_group = stack[--stack_size];
+                    }
+#ifndef DX11
+                    const int Nd = 4;
+                    const int Nw = 16;
+                    lostLoopIterations += countbits(~WaveActiveBallot(true)) - Nd;
+                    if(lostLoopIterations >= Nw) break;
+#endif
+                }
+#ifndef DX11
+        } while(Coun2 < 1000);
+#endif
+        #endif
+}
+
+
+#ifdef DX11
+[numthreads(64, 1, 1)]
+#else
+#ifdef HardwareRT
+[numthreads(32, 1, 1)]
+#else
+[numthreads(32, YAmount, 1)]
+#endif
+#endif
+void kernel_shadow(uint3 id : SV_DispatchThreadID, uint3 GT : SV_GroupThreadID) {//If I move the function contents into here, unity yells at me, so for now its just gonna continue to live in its function
+    IntersectBVHShadow(id.x, GT.y, GT.x);
+}

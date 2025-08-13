@@ -1,0 +1,136 @@
+#include "../GlobalDefines.cginc"
+#ifndef DX11
+    #pragma use_dxc
+#endif
+#include "CommonData.cginc"
+
+#ifdef HDRP
+Texture2DArray<float2> MotionVectors;
+#else
+Texture2D<float2> MotionVectors;
+#endif
+
+
+static const ColData InitCol = { 1,1,1,0,0,0,0,0,0,0,0,0,1,1,1,0};
+const static RayHit tempray = CreateRayHit();
+
+
+bool UseASVGFAndReSTIR;
+#pragma kernel Generate
+[numthreads(16, 16, 1)]
+void Generate(uint3 id : SV_DispatchThreadID) {
+
+    if (id.x >= screen_width || id.y >= screen_height) return;
+    const uint pixel_index = id.y * screen_width + id.x;
+    float2 jitter = ((random(0, pixel_index) - 0.5));
+    if(OIDNGuideWrite || UseASVGFAndReSTIR) jitter = 0;
+    float2 uv = float2((id.xy + jitter) / float2(screen_width, screen_height) * 2.0f - 1.0f);
+    SmallerRay ray = CreateCameraRay(uv, pixel_index);
+    RayData globray = {ray.origin + NearPlane * ray.direction, pixel_index, ray.direction, 0, 0,0,asuint(FarPlane),0};
+    GlobalRays[pixel_index] = globray;
+}
+
+#pragma kernel GeneratePanorama
+[numthreads(16, 16, 1)]
+void GeneratePanorama(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= screen_width || id.y >= screen_height) return;
+    const uint pixel_index = id.y * screen_width + id.x;
+    float2 jitter = ((random(0, pixel_index) - 0.5));
+    if(OIDNGuideWrite) jitter = 0;
+    float2 uv = float2((id.xy + jitter) / float2(screen_width, screen_height));
+    SmallerRay ray;
+    if(DoPanorama) {
+        uv.y = 1.0f - uv.y;
+        uv.x = (uv.x * (Segment.y - Segment.x)) + Segment.x;
+        uv.x = 1.0f - uv.x;
+
+        ray = CreateRay(mul(CamToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz + NearPlane * normalize(equirectUvToDirection(uv)), normalize(equirectUvToDirection(uv)));
+    } else {
+        uv.x = ((uv.x * (Segment.y - Segment.x)) + Segment.x);
+        uv = (uv * 2.0f) - 1.0f;
+
+        ray = CreateCameraRay(uv, pixel_index);
+        ray.origin = ray.origin + NearPlane * ray.direction;
+    }
+    RayData globray = {ray.origin, pixel_index, ray.direction, 0, 0,0,asuint(FarPlane),0};
+    GlobalRays[pixel_index] = globray;
+}
+
+#pragma kernel CacheResolve
+[numthreads(256, 1, 1)]
+void CacheResolve(uint3 id : SV_DispatchThreadID) {//we dont need to compress the hashes right? since we are only using 4, as long as we set ... no because we DO check for 0th
+#ifdef RadCache
+    //using the hash we should be able to reconstruct SOME kind of... oh
+    /*
+        WE STORE THE 8 BIT POSITIONS IN THE HASH BUFFER
+        we just need to reconstruct the actual hash from prev cam position data?
+
+    */
+
+    uint HashB = VoxelDataBufferB.Load(HashOffset + (id.x) * 4);//I am read and writing to the same hash buffer, this could be a problem
+
+    bool Valid = HashB != 0;
+    uint ResultantHash = 0;
+    uint4 ResultantVox = 0;
+    if(Valid) {
+        int idd = 0;
+        if(FindHashEntry(HashB, idd)) {
+            ResultantHash = HashB;
+            ResultantVox = VoxelDataBufferB.Load4(idd * 16);
+            uint SampleCount = min(ResultantVox.w & 0x00FFFFFF, 16777210);
+            uint FrameCount = (ResultantVox.w >> 24) & 0xFF;
+            FrameCount++;
+            if(SampleCount > 500) {
+                float Ratio = 500.0f / (float)SampleCount;
+                SampleCount = floor(Ratio * (float)SampleCount);
+                float3 Dat = (float3)ResultantVox.xyz / 1e3f;
+                Dat *= Ratio;
+                ResultantVox.xyz = Dat * 1e3f;
+            }
+            if(FrameCount > 90) {
+                ResultantVox.xyz = (((float3)ResultantVox.xyz / 1e3f) / (float)(SampleCount + FrameCount)) * 1e3f;
+                FrameCount = 0;
+                SampleCount = 1;
+                // ResultantHash = 0;
+            }
+            ResultantVox.w = (SampleCount | ((FrameCount & 0xFF) << 24));
+        }
+    }
+
+    VoxelDataBufferA.Store(HashOffset + (id.x) * 4, ResultantHash);//I am read and writing to the same hash buffer, this could be a problem
+    VoxelDataBufferA.Store4(id.x * 16, ResultantVox);
+#endif
+}
+
+
+#pragma kernel CacheCompact
+groupshared uint Hashes[64][BucketCount];
+
+[numthreads(64, BucketCount, 1)]
+void CacheCompact(uint3 id : SV_DispatchThreadID, uint3 GT : SV_GroupThreadID) {//we dont need to compress the hashes right? since we are only using 4, as long as we set ... no because we DO check for 0th
+#ifdef RadCache
+    Hashes[GT.x][GT.y] = VoxelDataBufferA.Load(HashOffset + (id.x * BucketCount + GT.y) * 4);
+    GroupMemoryBarrierWithGroupSync();
+    if(GT.y == 0) {
+        bool FoundZero = false;
+        bool FoundInconsistancy = false;
+        uint LocalBucket[BucketCount];
+        for(int i = 0; i < BucketCount; i++) LocalBucket[i] = 0;
+        uint CurCount = 0;
+        for(int i = 0; i < BucketCount; i++) {
+            if(Hashes[GT.x][i] == 0) FoundZero = true;
+            else {
+                LocalBucket[CurCount++] = Hashes[GT.x][i];
+                if(FoundZero) FoundInconsistancy = true;
+            }
+        }
+        if(FoundInconsistancy) {
+            for(int i = 0; i < BucketCount; i++) {
+                Hashes[GT.x][i] = LocalBucket[i];
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    VoxelDataBufferA.Store(HashOffset + (id.x * BucketCount + GT.y) * 4, Hashes[GT.x][GT.y]);
+#endif
+}

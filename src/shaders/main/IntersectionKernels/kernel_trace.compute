@@ -1,0 +1,398 @@
+#include "common.cginc"
+void IntersectTriangle(int mesh_id, const int tri_id, const SmallerRay ray, inout RayHit ray_hit, const int MatOffset, const float RandNum, inout float3 throughput) {
+    TrianglePos tri = triangle_get_positions(tri_id);
+
+    float3 h = cross(ray.direction, tri.posedge2);
+    float  a = dot(tri.posedge1, h);
+
+    float  f = rcp(a);
+    float3 s = ray.origin - tri.pos0;
+    float  u = f * dot(s, h);
+
+    float3 q = cross(s, tri.posedge1);
+    float  v = f * dot(ray.direction, q);
+
+    [branch]if (u >= 0 && v >= 0.0f && u + v <= 1.0f) {
+        float t = f * dot(tri.posedge2, q);
+
+        [branch]if (t > 0 && t < ray_hit.t) {
+            const TriangleUvs tri2 = triangle_get_positions2(tri_id);
+            const int MaterialIndex = (MatOffset + AggTrisA[tri_id].MatDat);
+            //major slowdown
+            #ifdef AdvancedAlphaMapped
+                [branch]if(_IntersectionMaterials[MaterialIndex].MatType == CutoutIndex) {
+                    float2 BaseUv = tri2.pos0 * (1.0f - u - v) + tri2.posedge1 * u + tri2.posedge2 * v;
+                    if(_IntersectionMaterials[MaterialIndex].AlphaTex.x > 0) { 
+                        float Alph = SampleTexture(BaseUv, SampleAlpha, _IntersectionMaterials[MaterialIndex]).x;
+                        if((GetFlag(_IntersectionMaterials[MaterialIndex].Tag, InvertAlpha) ? (1.0f - Alph) : Alph) < _IntersectionMaterials[MaterialIndex].AlphaCutoff) return;
+                    }
+                }
+            #endif
+            #ifdef IgnoreGlassMain
+                if(_IntersectionMaterials[MaterialIndex].specTrans == 1) return;
+            #endif
+            #ifdef IgnoreBackfacing
+                if(_IntersectionMaterials[MaterialIndex].specTrans != 1 && dot(normalize(cross(normalize(tri.posedge1), normalize(tri.posedge2))), ray.direction) <= 0) return;
+            #endif
+            #ifdef FadeMapping
+                [branch]if(_IntersectionMaterials[MaterialIndex].MatType == FadeIndex) {
+                    float2 BaseUv = tri2.pos0 * (1.0f - u - v) + tri2.posedge1 * u + tri2.posedge2 * v;
+                    if(_IntersectionMaterials[MaterialIndex].AlphaTex.x > 0) {
+                        float Alph = SampleTexture(BaseUv, SampleAlpha, _IntersectionMaterials[MaterialIndex]).x;
+#ifdef AltFadeMapping
+                        throughput *= lerp(1, SampleTexture(BaseUv, SampleAlbedo, _IntersectionMaterials[MaterialIndex]), (GetFlag(_IntersectionMaterials[MaterialIndex].Tag, InvertAlpha) ? (1.0f - Alph) : Alph) + _IntersectionMaterials[MaterialIndex].AlphaCutoff);
+                        return;
+#else
+                        if((GetFlag(_IntersectionMaterials[MaterialIndex].Tag, InvertAlpha) ? (1.0f - Alph) : Alph) - _IntersectionMaterials[MaterialIndex].AlphaCutoff <= RandNum) return;
+#endif
+                    }
+                }
+            #endif
+            if(CurBounce == 0 && GetFlag(_IntersectionMaterials[MaterialIndex].Tag, Invisible)) return;
+            ray_hit.t = t;
+            ray_hit.u = u;
+            ray_hit.v = v;
+            ray_hit.mesh_id = mesh_id;
+            ray_hit.triangle_id = tri_id;
+        }
+    }
+}
+
+#define YAmount 2
+groupshared int nextRayArray[YAmount];
+// groupshared uint2 KilledRays;
+void IntersectBVH(int ray_index, int threadIdxy, int GTx) {
+    #ifdef HardwareRT
+        if(ray_index >= BufferSizes[CurBounce].tracerays) return;
+    #endif
+    RayHit bestHit;
+    SmallerRay ray;
+    float3 throughput = 1;
+    #ifndef HardwareRT
+        int Reps = 0;
+        uint2 stack[16];
+        int stack_size = 0;
+        uint2 current_group;
+        uint oct_inv4;
+        int tlas_stack_size = -1;
+        SmallerRay ray2;
+        int NodeOffset = 0;
+        int TriOffset = 0;
+        int MatOffset = 0;
+        int mesh_id = -1;
+#if DebugView == DVBVHViewAdvanced
+        int stack_memory_counter;
+        int node_memory_counter;
+        int triangle_memory_counter;
+        int node_traverse_counter;
+        int triangle_traverse_counter;
+#endif
+    #endif
+
+        RayData GlobalRay;
+        bestHit = CreateRayHit();
+        float RandNum;
+
+        #ifdef HardwareRT
+            [branch]if(CurBounce % 2 == 1) ray_index += screen_width * screen_height;
+            GlobalRay = GlobalRays[ray_index];
+            RandNum = random(43, GlobalRay.PixelIndex).x;
+            if(CurBounce == 0) bestHit.t = asfloat(GlobalRay.hits.z);
+            const uint rayFlags = RAY_FLAG_FORCE_OPAQUE  ;
+            RayQuery<rayFlags> q;
+            RayDesc myRay;
+            myRay.Origin = GlobalRays[ray_index].origin;
+            myRay.Direction = GlobalRays[ray_index].direction;
+            ray.origin = myRay.Origin;
+            ray.direction = myRay.Direction;
+            myRay.TMin = 0;
+            myRay.TMax = bestHit.t;
+            // bestHit.t = FarPlane;
+            while(true) {
+               q.TraceRayInline(myAccelerationStructure, rayFlags, 0xff, myRay);
+                while(q.Proceed()){}
+
+                if(q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+                    bestHit.t = q.CommittedRayT();
+                    bestHit.u = q.CommittedTriangleBarycentrics().y;
+                    bestHit.v = q.CommittedTriangleBarycentrics().x;
+                    bestHit.mesh_id = uint(q.CommittedInstanceID() | (q.CommittedGeometryIndex() << 25));
+                    bestHit.triangle_id = q.CommittedPrimitiveIndex();
+                    #if defined(AdvancedAlphaMapped) || defined(IgnoreBackfacing) || defined(FadeMapping) || defined(IgnoreGlassMain)
+                        int2 Indexes = int2(bestHit.mesh_id & 0x1FFFFFF, bestHit.mesh_id >> 25);
+                        int triangleOffset = SubMeshOffsets[MeshOffsets[Indexes.x].x + Indexes.y];
+                        int tri_id = bestHit.triangle_id + triangleOffset;
+                        int mesh_id = MeshOffsets[Indexes.x].y;
+                        int MaterialIndex = (_MeshData[mesh_id].MaterialOffset + AggTrisA[tri_id].MatDat);
+                    #endif
+                    #ifdef AdvancedAlphaMapped
+                        if(CurBounce == 0 && GetFlag(_IntersectionMaterials[MaterialIndex].Tag, Invisible)) {myRay.TMin = bestHit.t + 0.0001f; bestHit.t = FarPlane; continue;}
+                        if(_IntersectionMaterials[MaterialIndex].MatType == CutoutIndex) {
+                            float2 BaseUv = TOHALF(AggTrisA[tri_id].tex0) * (1.0f - bestHit.u - bestHit.v) + TOHALF(AggTrisA[tri_id].texedge1) * bestHit.u + TOHALF(AggTrisA[tri_id].texedge2) * bestHit.v;
+                            if(_IntersectionMaterials[MaterialIndex].AlphaTex.x > 0) {
+                                float Alph = SampleTexture(BaseUv, SampleAlpha, _IntersectionMaterials[MaterialIndex]).x;
+                                if((GetFlag(_IntersectionMaterials[MaterialIndex].Tag, InvertAlpha) ? (1.0f - Alph) : Alph) < _IntersectionMaterials[MaterialIndex].AlphaCutoff) {myRay.TMin = bestHit.t + 0.0001f; bestHit.t = FarPlane; continue;}
+                            }
+                        }
+                    #endif
+                    #ifdef IgnoreGlassMain
+                        if(_IntersectionMaterials[MaterialIndex].specTrans == 1) {myRay.TMin = bestHit.t + 0.0001f; bestHit.t = FarPlane; continue;}
+                    #endif
+                    #ifdef IgnoreBackfacing
+                        TrianglePos tri = triangle_get_positions(tri_id);
+                        if(_IntersectionMaterials[MaterialIndex].specTrans != 1 && dot(normalize(cross(normalize(tri.posedge1), normalize(tri.posedge2))), mul((float3x3)_MeshData[mesh_id].W2L, ray.direction)) <= 0) {myRay.TMin = bestHit.t + 0.0001f; bestHit.t = FarPlane; continue;}
+                    #endif
+                    #ifdef FadeMapping
+                        if(_IntersectionMaterials[MaterialIndex].MatType == FadeIndex) {
+                            float2 BaseUv = TOHALF(AggTrisA[tri_id].tex0) * (1.0f - bestHit.u - bestHit.v) + TOHALF(AggTrisA[tri_id].texedge1) * bestHit.u + TOHALF(AggTrisA[tri_id].texedge2) * bestHit.v;
+                            if(_IntersectionMaterials[MaterialIndex].AlphaTex.x > 0) {
+                                float Alph = SampleTexture(BaseUv, SampleAlpha, _IntersectionMaterials[MaterialIndex]).x;
+#ifdef AltFadeMapping           
+                                throughput *= lerp(1, SampleTexture(BaseUv, SampleAlbedo, _IntersectionMaterials[MaterialIndex]), (GetFlag(_IntersectionMaterials[MaterialIndex].Tag, InvertAlpha) ? (1.0f - Alph) : Alph) + _IntersectionMaterials[MaterialIndex].AlphaCutoff);
+                                myRay.TMin = bestHit.t + 0.0001f; bestHit.t = FarPlane; continue;
+#else
+                                if((GetFlag(_IntersectionMaterials[MaterialIndex].Tag, InvertAlpha) ? (1.0f - Alph) : Alph) - _IntersectionMaterials[MaterialIndex].AlphaCutoff <= RandNum) {myRay.TMin = bestHit.t + 0.0001f; bestHit.t = FarPlane; continue;}
+#endif
+                            }
+                        }
+                    #endif
+                }
+                break;
+            }
+
+
+            int PixIndex = GlobalRay.PixelIndex;
+            uint2 TempUv = uint2(PixIndex % screen_width, PixIndex / screen_width);
+            int2 Indexes = int2(bestHit.mesh_id & 0x1FFFFFF, bestHit.mesh_id >> 25);
+            [branch]if(CurBounce == 0) {
+                _PrimaryTriangleInfo[TempUv] = uint4(MeshOffsets[Indexes.x].y, bestHit.triangle_id + SubMeshOffsets[MeshOffsets[Indexes.x].x + Indexes.y] - _MeshData[MeshOffsets[Indexes.x].y].TriOffset, asuint(bestHit.u), asuint(bestHit.v));
+#ifdef AltFadeMapping
+                GlobalColors[PixIndex].Flags = packRGBE(throughput);
+#endif
+            } else if(GetBounceData(GlobalColors[PixIndex].MetRoughIsSpec) == 0 || CurBounce + 1 == GetBounceData(GlobalColors[PixIndex].MetRoughIsSpec)) {
+                _PrimaryTriangleInfo[TempUv] = ((UseReSTIRGI && bestHit.t != FarPlane) ? uint4(MeshOffsets[Indexes.x].y, bestHit.triangle_id + SubMeshOffsets[MeshOffsets[Indexes.x].x + Indexes.y] - _MeshData[MeshOffsets[Indexes.x].y].TriOffset, asuint(bestHit.u), asuint(bestHit.v)) : ((UseASVGF || bestHit.t != FarPlane) ? uint4(asuint(ray.direction), 99993) : uint4(asuint(ray.direction * bestHit.t + ray.origin), 99993)));
+            }
+
+            if(CurBounce == 0 && bestHit.t == asfloat(GlobalRay.hits.z)) bestHit.t = FarPlane;
+            set(ray_index, bestHit);
+        #else
+            current_group.x = (uint)0;
+            current_group.y = 0;//(uint)0x80000000;
+            uint2 triangle_group = 0;
+#ifndef DX11
+            if(ray_index == 0) {
+                nextRayArray[threadIdxy] = BufferSizes[CurBounce].TracedRays;
+            }
+            GroupMemoryBarrier();
+            bool KilledNaturally = true;
+#endif
+            int rayidx = 0;
+            const static int A = BufferSizes[CurBounce].tracerays;
+#ifndef DX11
+    int Coun3 = 0;
+        [loop]do{
+            Coun3++;
+            bool                terminated = KilledNaturally;//(stack_size == 0 && current_group.y <= 0x00FFFFFF && triangle_group.y == 0);
+            const uint  maskTerminated = WaveActiveBallot(terminated);
+            const int           numTerminated = countbits(maskTerminated);
+            const int           idxTerminated = countbits(maskTerminated & ((1u << GTx) - 1));
+            KilledNaturally = false;
+            if(terminated) {
+                Reps = 0;
+                current_group.y = 0b10000000000000000000000000000000;//(uint)0x80000000;
+#else
+                current_group.y = (uint)0x80000000;
+#endif
+                current_group.x = (uint)0;
+                triangle_group = 0;
+#ifndef DX11
+                if(idxTerminated == 0) {
+                    InterlockedAdd(BufferSizes[CurBounce].TracedRays, numTerminated, nextRayArray[threadIdxy]);
+                }
+                GroupMemoryBarrier();
+
+
+                rayidx = nextRayArray[threadIdxy] + idxTerminated;
+                if(rayidx >= A) {
+                    // InterlockedOr(KilledRays[threadIdxy], 1 << GTx);
+                    break;
+                }
+#else
+                rayidx = ray_index;
+                if(rayidx >= A) return;
+#endif
+                [branch]if(CurBounce % 2 == 1) rayidx += screen_width * screen_height;
+                GlobalRay = GlobalRays[rayidx];
+                RandNum = random(43, GlobalRay.PixelIndex).x;
+                bestHit = CreateRayHit();
+                if(CurBounce == 0) bestHit.t = asfloat(GlobalRay.hits.z);
+
+
+                ray.origin = GlobalRay.origin;
+                ray.direction = (GlobalRay.direction == 0 ? EPSILON : GlobalRay.direction);
+                ray2 = ray;
+
+                tlas_stack_size = -1;
+                stack_size = 0;
+                NodeOffset = 0;
+                TriOffset = 0;
+                MatOffset = 0;
+                mesh_id = -1;
+                oct_inv4 = ray_get_octant_inv4(ray.direction);
+                throughput = 1;
+    #if DebugView == DVBVHViewAdvanced
+                stack_memory_counter = 0;
+                node_memory_counter = 0;
+                triangle_memory_counter = 0;
+                node_traverse_counter = 0;
+                triangle_traverse_counter = 0;
+    #endif
+#ifndef DX11
+            }
+
+                int lostLoopIterations = 0;
+#endif
+
+            [loop]while (Reps < MaxTraversalSamples) {//Traverse Accelleration Structure(Compressed Wide Bounding Volume Hierarchy)          
+
+                [branch]if (current_group.y > 0x00FFFFFF) {
+                    uint child_index_offset = firstbithigh(current_group.y);
+
+                    uint slot_index = (child_index_offset - 24) ^ (oct_inv4 & 0xff);
+                    uint relative_index = countbits(current_group.y & ~(0xffffffff << slot_index));
+                    uint child_node_index = current_group.x + relative_index;
+                    const BVHNode8Data TempNode = cwbvh_nodes[child_node_index];
+
+                    current_group.y &= ~(1 << child_index_offset);
+
+                    if (current_group.y > 0x00FFFFFF) stack[stack_size++] = current_group;
+
+                    current_group.x = (TempNode.nodes[1].x) + NodeOffset;
+                    triangle_group.x = (TempNode.nodes[1].y) + TriOffset;
+
+                    uint hitmask = cwbvh_node_intersect(ray, oct_inv4, bestHit.t, TempNode);
+
+                    current_group.y = (hitmask & 0xff000000) | ((TempNode.nodes[0].w >> 24) & 0xff);
+                    triangle_group.y = (hitmask & 0x00ffffff);
+
+                    Reps++;
+    #if DebugView == DVBVHViewAdvanced
+                    node_memory_counter += 80;
+                    node_traverse_counter += 5;
+    #endif
+                } else {
+                    triangle_group = current_group;
+                    current_group = (uint)0;
+                }
+
+                if(triangle_group.y != 0) {
+                    [branch]if(tlas_stack_size == -1) {
+                        uint mesh_offset = firstbithigh(triangle_group.y);
+                        triangle_group.y &= ~(1 << mesh_offset);
+                        mesh_id = TLASBVH8Indices[triangle_group.x + mesh_offset];
+                        NodeOffset = _MeshData[mesh_id].NodeOffset;
+                        TriOffset = _MeshData[mesh_id].TriOffset;
+
+                        if (triangle_group.y != 0) stack[stack_size++] = triangle_group;
+                        if (current_group.y & 0xff000000) stack[stack_size++] = current_group;
+
+                        tlas_stack_size = stack_size;
+
+                        int root_index = (_MeshData[mesh_id].mesh_data_bvh_offsets & 0x7fffffff);
+
+                        MatOffset = _MeshData[mesh_id].MaterialOffset;
+                        ray.direction = (mul((float3x3)_MeshData[mesh_id].W2L, ray.direction));
+                        ray.origin = (mul(_MeshData[mesh_id].W2L, float4(ray.origin, 1))).xyz;
+
+                        oct_inv4 = ray_get_octant_inv4(ray.direction);
+
+                        current_group.x = (uint)root_index;
+                        current_group.y = (uint)0x80000000;
+                    } else {
+                        while (triangle_group.y != 0) {
+                            uint triangle_index = firstbithigh(triangle_group.y);
+                            triangle_group.y &= ~(1 << triangle_index);
+                            IntersectTriangle(mesh_id, triangle_group.x + triangle_index, ray, bestHit, MatOffset, RandNum, throughput);//Intersect Mesh Triangles
+    #if DebugView == DVBVHViewAdvanced
+                            triangle_traverse_counter += 1;
+                            triangle_memory_counter += 52;
+    #endif
+
+                        }
+                    }
+                }
+              
+                if ((current_group.y & 0xff000000) == 0) {
+                    if (stack_size == 0) {//thread has finished traversing
+                        int PixIndex = GlobalRay.PixelIndex;
+                        uint2 TempUv = uint2(PixIndex % screen_width, PixIndex / screen_width);
+                        GlobalColors[PixIndex].throughput *= throughput;
+                        [branch]if(CurBounce == 0) {
+                            _PrimaryTriangleInfo[TempUv] = uint4(bestHit.mesh_id, bestHit.triangle_id - _MeshData[bestHit.mesh_id].TriOffset, asuint(bestHit.u), asuint(bestHit.v));
+#ifdef AltFadeMapping
+                GlobalColors[PixIndex].Flags = packRGBE(throughput);
+#endif
+                            #if DebugView == DVBVHView
+                                _DebugTex[TempUv] = float4(Reps / 43.0f, Reps > 80, 0, 1);
+                            #elif DebugView == DVBVHViewAdvanced
+                                int memory_counter = node_memory_counter + triangle_memory_counter + stack_memory_counter;
+                                int traverse_counter = node_traverse_counter + 6.0f * triangle_traverse_counter;
+                                int total_counter = memory_counter / 64.0f + traverse_counter;
+                                float scaled_heatmap_value = ((float)total_counter) / 500.0f;
+                                float heatmap_value = 781 - (781 - 380) * exp(-scaled_heatmap_value);
+                                _DebugTex[TempUv] = float4(waveLengthToRGB(heatmap_value), 1);
+                            #endif
+                        } else if(GetBounceData(GlobalColors[PixIndex].MetRoughIsSpec) == 0 || CurBounce + 1 == GetBounceData(GlobalColors[PixIndex].MetRoughIsSpec)) {
+                            _PrimaryTriangleInfo[TempUv] = ((UseReSTIRGI && bestHit.t != FarPlane) ? uint4(bestHit.mesh_id, bestHit.triangle_id - _MeshData[bestHit.mesh_id].TriOffset, asuint(bestHit.u), asuint(bestHit.v)) : ((UseASVGF || bestHit.t != FarPlane) ? uint4(asuint(ray2.direction), 99993) : uint4(asuint(ray2.direction * bestHit.t + ray2.origin), 99993)));
+                        }
+                        if(CurBounce == 0 && bestHit.t == asfloat(GlobalRay.hits.z)) bestHit.t = FarPlane;
+                        set(rayidx, bestHit);
+#ifndef DX11
+                        KilledNaturally = true;
+#endif
+                        break;
+                    }
+
+                    if (stack_size == tlas_stack_size) {
+                        NodeOffset = 0;
+                        TriOffset = 0;
+                        tlas_stack_size = -1;
+                        ray = ray2;
+                        oct_inv4 = ray_get_octant_inv4(ray.direction);
+                    }
+                    current_group = stack[--stack_size];
+    #if DebugView == DVBVHViewAdvanced
+                    stack_memory_counter += 8;
+    #endif
+                }
+#ifndef DX11
+                    const static int Nd = 4;
+                    const static int Nw = 16;
+                    lostLoopIterations += countbits(~WaveActiveBallot(true)) - Nd;// - countbits(KilledRays.x) - countbits(KilledRays.y);
+                    if(lostLoopIterations >= Nw) break;
+#endif
+            }
+#ifndef DX11
+    } while(Coun3 < 1000);
+#endif
+    #endif
+    // InterlockedOr(KilledRays[threadIdxy], 1 << GTx);
+}
+
+
+#ifdef DX11
+[numthreads(64, 1, 1)]
+#else
+#ifdef HardwareRT
+[numthreads(32, 1, 1)]
+#else
+[numthreads(32, YAmount, 1)]
+#endif
+#endif
+void kernel_trace(uint3 id : SV_DispatchThreadID, uint3 GT : SV_GroupThreadID) {//If I move the function contents into here, unity yells at me, so for now its just gonna continue to live in its function
+    // if(GT.x == 0 && GT.y == 0) {
+    //     KilledRays = 0;
+    // }
+    // GroupMemoryBarrierWithGroupSync();
+    IntersectBVH(id.x, GT.y, GT.x);
+}

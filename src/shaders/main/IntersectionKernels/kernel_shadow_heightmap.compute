@@ -1,0 +1,108 @@
+#include "common.cginc"
+static float g = sin(atan(1.0f / 2.0f));
+
+inline bool rayBoxIntersection(const float3 ray_orig, const float3 ray_dir, const float3 Min, const float3 Max, float tMax, inout float t0) {
+    const float3 tmp_min = (Min - ray_orig) / ray_dir;
+    const float3 tmp_max = (Max - ray_orig) / ray_dir;
+    const float3 tmin = min(tmp_min, tmp_max);
+    const float3 tmax = max(tmp_min, tmp_max);
+    t0 = max(tmin.x, max(tmin.y, max(tmin.z, 0.025f))); // Usually ray_tmin = 0
+    float t1 = min(tmax.x, min(tmax.y, min(tmax.z, tMax)));
+    return (t0 <= t1);
+}
+
+
+bool IntersectHeightMapShadow(SmallerRay ray, float MaxDist) {
+    float3 Origin = ray.origin;
+    for (int i = 0; i < TerrainCount; i++) {
+        const TerrainData Terrain = Terrains[i];
+        float t0;
+        if (rayBoxIntersection(Origin, ray.direction, Terrain.PositionOffset, Terrain.PositionOffset + float3(Terrain.TerrainDim.x, Terrain.TerrainDim.x, Terrain.TerrainDim.y), MaxDist, t0)) {
+            ray.origin = Origin + ray.direction * (t0 + 0.001f) - Terrain.PositionOffset;
+            float3 CurrentPos = ray.origin;
+            int step_count = 0;
+            float Dist = 0;
+            bool RefinementPhase = false;
+            while (step_count < 2000 && Dist < MaxDist) {
+                CurrentPos = ray.origin + ray.direction * Dist;
+                float3 b = float3(Terrain.TerrainDim.x, 0.01f, Terrain.TerrainDim.y);
+                float3 q = (abs(CurrentPos) - b);
+                q.x /= Terrain.TerrainDim.x;
+                q.z /= Terrain.TerrainDim.y;
+                float2 uv = float2(min(CurrentPos.x / Terrain.TerrainDim.x, 1), min(CurrentPos.z / Terrain.TerrainDim.y, 1)) * (Terrain.HeightMap.xy - Terrain.HeightMap.zw) + Terrain.HeightMap.zw;
+                step_count++;
+                float h = Heightmap.SampleLevel(sampler_trilinear_clamp, uv, 0).x;
+                h *= Terrain.HeightScale * 2.0f;
+                q.y -= h;
+                q.y *= g;
+
+                q = max(0, q);
+                float dist = length(q);
+                if (dist < 0.0001f) {
+                    return true;
+                }
+                if(!RefinementPhase) dist += (float)step_count / 200.0f;
+                Dist += dist / 2.0f;
+                if(Dist >= MaxDist || !(all(ray.origin + ray.direction * Dist < float3(Terrain.TerrainDim.x, 1000.0f, Terrain.TerrainDim.y)) && all(ray.origin + ray.direction * Dist > 0))) {
+                    if(RefinementPhase) break;
+                    float dist2;
+                    bool throwa = GetDist(ray.origin + ray.direction * Dist, uv, dist2, Terrain);
+                    dist -= (float)step_count / 200.0f;
+                    Dist -= (float)step_count / 200.0f;
+                    RefinementPhase = true;
+                }
+
+            }
+        }
+    }
+    return false;
+
+}
+
+void IntersectShadowHeightmap(int ray_index) {
+    if(ray_index >= BufferSizes[CurBounce].shadow_rays) return;
+    int pixel_index = ShadowRaysBuffer[ray_index].PixelIndex;
+    SmallerRay ray = CreateRay(ShadowRaysBuffer[ray_index].origin, normalize(ShadowRaysBuffer[ray_index].EndPoint - ShadowRaysBuffer[ray_index].origin));
+    ray.direction = select(ray.direction == 0, EPSILON, ray.direction);
+    bool HitHeightmap = TerrainExists;
+    if(ShadowRaysBuffer[ray_index].FIELD != -2) {
+        if (TerrainExists) HitHeightmap = IntersectHeightMapShadow(ray, length(ShadowRaysBuffer[ray_index].EndPoint - ShadowRaysBuffer[ray_index].origin));                  
+        if(!HitHeightmap) {
+            uint PixelIndex = ShadowRaysBuffer[ray_index].PixelIndex & 0xFFFFFFF;
+            bool IsNotPrimaryNEERay = (ShadowRaysBuffer[ray_index].PixelIndex >> 30);
+            if(CurBounce == 0) NEEPosA[uint2(PixelIndex % screen_width, PixelIndex / screen_width)] = float4(ShadowRaysBuffer[ray_index].EndPoint, 0);
+            #ifdef RadCache
+                CacheBuffer[PixelIndex].RunningIlluminance = packRGBE(unpackRGBE(ShadowRaysBuffer[ray_index].DiffuseIlluminance) + unpackRGBE(CacheBuffer[PixelIndex].RunningIlluminance));
+                AddHitToCachePartial(CacheBuffer[PixelIndex], ShadowRaysBuffer[ray_index].origin);
+            #endif
+            if (IsNotPrimaryNEERay) {
+                if (CurBounce == 0) {
+                    #ifdef RadCache
+                        GlobalColors[PixelIndex].PrimaryNEERay = packRGBE(pow(unpackRGBE(GlobalColors[PixelIndex].PrimaryNEERay),2.2f) + pow(ShadowRaysBuffer[ray_index].illumination,rcp(2.2f)));
+                    #else
+                        GlobalColors[PixelIndex].Direct += ShadowRaysBuffer[ray_index].illumination;
+                    #endif
+                } else {
+                    #ifdef RadCache
+                        if(GetBounceData(CacheBuffer[PixelIndex].pathLength) == 0) GlobalColors[PixelIndex].Indirect += ShadowRaysBuffer[ray_index].illumination;
+                    #else
+                        GlobalColors[PixelIndex].Indirect += ShadowRaysBuffer[ray_index].illumination;
+                    #endif
+                }
+            } else {
+                if(CurBounce != 0 && ((!UseReSTIRGI && GetBounceData(GlobalColors[PixelIndex].MetRoughIsSpec) == 0) || !UseASVGF)) GlobalColors[PixelIndex].Indirect += ShadowRaysBuffer[ray_index].illumination;// * unpackRGBE(asuint(ShadowRay.DiffuseIlluminance));
+                else GlobalColors[PixelIndex].PrimaryNEERay = packRGBE(pow(unpackRGBE(GlobalColors[PixelIndex].PrimaryNEERay),2.2f) + pow(ShadowRaysBuffer[ray_index].illumination,rcp(2.2f)));
+            }
+        }
+    }
+}
+
+
+#ifdef DX11
+[numthreads(64, 1, 1)]
+#else
+[numthreads(32, 1, 1)]
+#endif
+void kernel_shadow_heightmap(uint3 id : SV_DispatchThreadID) {//If I move the function contents into here, unity yells at me, so for now its just gonna continue to live in its function
+    IntersectShadowHeightmap(id.x);
+}

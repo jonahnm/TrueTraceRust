@@ -1,0 +1,25 @@
+[package]
+name = "TrueTraceRust"
+version = "0.1.0"
+edition = "2024"
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+winapi = {version = "0.3.9",features = ["errhandlingapi","winnt","winuser","debug","minwinbase","memoryapi","excpt","libloaderapi","minwindef"]}
+lazy_mut = "0.2.1"
+retour = { features = ["static-detour"], git = "https://github.com/workingjubilee/hpmason-retour-rs.git", branch = "fix-retour-for-unsupported-fn-ptr-calling-conventions" }
+wgpu = { git = "https://github.com/SupaMaggie70Incorporated/wgpu.git", branch = "precompiled-shaders", features = ["spirv","wgpu-core","custom"] }
+wgpu-types = {git = "https://github.com/SupaMaggie70Incorporated/wgpu.git", branch = "precompiled-shaders",features = ["default","trace"]}
+wgpu-hal = { git = "https://github.com/SupaMaggie70Incorporated/wgpu.git", branch = "precompiled-shaders",features = ["dx12"] }
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread"] }
+windows = "0.58.0"
+stdio-override = "0.2.0"
+spirv-reflect = { git = "https://github.com/gfxstrand/spirv-reflect-rs.git" }
+bytemuck = "1.23.1"
+lazy_static = "1.5.0"
+async-std = "1.13.1"
+spirv-cross2 = { version = "0.4.6",features = ["full"] }
+nalgebra = "0.34.0"
+[profile.dev]
+debug = true
+split-debuginfo = "packed"
