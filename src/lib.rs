@@ -5,7 +5,7 @@
 
 mod render;
 mod shaders;
-mod common_vars;
+mod compute_shader_interop;
 
 use std::ffi::{c_void, CStr, CString, OsString};
 use std::fs::File;

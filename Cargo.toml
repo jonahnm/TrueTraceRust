@@ -23,3 +23,5 @@ nalgebra = "0.34.0"
 [profile.dev]
 debug = true
 split-debuginfo = "packed"
+[build-dependencies]
+csbindgen = {git = "https://github.com/mmusial/csbindgen.git",branch = "mangle2024"}

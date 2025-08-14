@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::hint::unreachable_unchecked;
 use std::io::Write;
-use std::mem::forget;
+use std::mem::{forget, MaybeUninit};
 use std::ops::Deref;
+use std::sync::Arc;
 use lazy_mut::LazyMut;
 use lazy_static::lazy::Lazy;
 use spirv_cross2::compile::CompilableTarget;
@@ -20,7 +21,7 @@ use crate::{DEVICE, LOG_FILE};
 use crate::shaders;
 use crate::shaders::{KernelStruct, Kernels};
 
-static KERNELS: LazyMut<Option<Kernels>> = LazyMut::new(|| None);
+pub(crate) static KERNELS: LazyMut<Option<&'static mut Kernels>> = LazyMut::new(|| None);
 #[unsafe(no_mangle)]
 pub extern "C" fn init() {
     std::panic::set_hook(Box::new(|panic_info| {
@@ -30,56 +31,107 @@ pub extern "C" fn init() {
             let _ = writeln!(file,"Occurred in file {} at line {}",location.file(),location.line());
         }
     }));
-    let shaders = HashMap::<(&str,&str),Vec<u8>>::from([
-        (("IntersectionKernels","kernel_heightmap"),include_bytes!("shaders/main/IntersectionKernels/kernel_heightmap.spv").to_vec()),
-        (("IntersectionKernels","kernel_shadow"),include_bytes!("shaders/main/IntersectionKernels/kernel_shadow.spv").to_vec()),
-        (("IntersectionKernels","kernel_shadow_heightmap"),include_bytes!("shaders/main/IntersectionKernels/kernel_shadow_heightmap.spv").to_vec()),
-        (("IntersectionKernels","kernel_trace"),include_bytes!("shaders/main/IntersectionKernels/kernel_trace.spv").to_vec()),
-        (("RayGenKernels","CacheCompact"),include_bytes!("shaders/main/RayGenKernels/CacheCompact.spv").to_vec()),
-        (("RayGenKernels","CacheResolve"),include_bytes!("shaders/main/RayGenKernels/CacheResolve.spv").to_vec()),
-        (("RayGenKernels","Generate"),include_bytes!("shaders/main/RayGenKernels/Generate.spv").to_vec()),
-        (("RayGenKernels","GeneratePanorama"),include_bytes!("shaders/main/RayGenKernels/GeneratePanorama.spv").to_vec()),
-        (("RayTracingShader","kernel_finalize"),include_bytes!("shaders/main/RayTracingShader/kernel_finalize.spv").to_vec()),
-        (("RayTracingShader","kernel_shade"),include_bytes!("shaders/main/RayTracingShader/kernel_shade.spv").to_vec()),
-        (("RayTracingShader","MVKernel"),include_bytes!("shaders/main/RayTracingShader/MVKernel.spv").to_vec()),
-        (("RayTracingShader","OIDNtoTTKernel"),include_bytes!("shaders/main/RayTracingShader/OIDNtoTTKernel.spv").to_vec()),
-        (("RayTracingShader","RefineMVKernel"),include_bytes!("shaders/main/RayTracingShader/RefineMVKernel.spv").to_vec()),
-        (("RayTracingShader","ResetMVKernel"),include_bytes!("shaders/main/RayTracingShader/ResetMVKernel.spv").to_vec()),
-        (("RayTracingShader","TransferKernel"),include_bytes!("shaders/main/RayTracingShader/TransferKernel.spv").to_vec()),
-        (("RayTracingShader","TTtoOIDNKernel"),include_bytes!("shaders/main/RayTracingShader/TTtoOIDNKernel.spv").to_vec()),
-        (("RayTracingShader","TTtoOIDNKernelPanorama"),include_bytes!("shaders/main/RayTracingShader/TTtoOIDNKernelPanorama.spv").to_vec()),
-        (("ReSTIRGI","ReSTIRGIKernel"),include_bytes!("shaders/main/ReSTIRGI/ReSTIRGIKernel.spv").to_vec()),
-        (("ReSTIRGI","ReSTIRGISpatial"),include_bytes!("shaders/main/ReSTIRGI/ReSTIRGISpatial.spv").to_vec()),
-        (("ReSTIRGI","ReSTIRGISpatial2"),include_bytes!("shaders/main/ReSTIRGI/ReSTIRGISpatial2.spv").to_vec()),
+    let shaders = HashMap::<(&str,&str,u32),Vec<u8>>::from([
+        (("IntersectionKernels","kernel_heightmap",1),include_bytes!("shaders/main/IntersectionKernels/kernel_heightmap.spv").to_vec()),
+        (("IntersectionKernels","kernel_shadow",2),include_bytes!("shaders/main/IntersectionKernels/kernel_shadow.spv").to_vec()),
+        (("IntersectionKernels","kernel_shadow_heightmap",3),include_bytes!("shaders/main/IntersectionKernels/kernel_shadow_heightmap.spv").to_vec()),
+        (("IntersectionKernels","kernel_trace",4),include_bytes!("shaders/main/IntersectionKernels/kernel_trace.spv").to_vec()),
+        (("RayGenKernels","CacheCompact",1),include_bytes!("shaders/main/RayGenKernels/CacheCompact.spv").to_vec()),
+        (("RayGenKernels","CacheResolve",2),include_bytes!("shaders/main/RayGenKernels/CacheResolve.spv").to_vec()),
+        (("RayGenKernels","Generate",3),include_bytes!("shaders/main/RayGenKernels/Generate.spv").to_vec()),
+        (("RayGenKernels","GeneratePanorama",4),include_bytes!("shaders/main/RayGenKernels/GeneratePanorama.spv").to_vec()),
+        (("RayTracingShader","kernel_finalize",1),include_bytes!("shaders/main/RayTracingShader/kernel_finalize.spv").to_vec()),
+        (("RayTracingShader","kernel_shade",2),include_bytes!("shaders/main/RayTracingShader/kernel_shade.spv").to_vec()),
+        (("RayTracingShader","MVKernel",3),include_bytes!("shaders/main/RayTracingShader/MVKernel.spv").to_vec()),
+        (("RayTracingShader","OIDNtoTTKernel",4),include_bytes!("shaders/main/RayTracingShader/OIDNtoTTKernel.spv").to_vec()),
+        (("RayTracingShader","RefineMVKernel",5),include_bytes!("shaders/main/RayTracingShader/RefineMVKernel.spv").to_vec()),
+        (("RayTracingShader","ResetMVKernel",6),include_bytes!("shaders/main/RayTracingShader/ResetMVKernel.spv").to_vec()),
+        (("RayTracingShader","TransferKernel",7),include_bytes!("shaders/main/RayTracingShader/TransferKernel.spv").to_vec()),
+        (("RayTracingShader","TTtoOIDNKernel",8),include_bytes!("shaders/main/RayTracingShader/TTtoOIDNKernel.spv").to_vec()),
+        (("RayTracingShader","TTtoOIDNKernelPanorama",9),include_bytes!("shaders/main/RayTracingShader/TTtoOIDNKernelPanorama.spv").to_vec()),
+        (("ReSTIRGI","ReSTIRGIKernel",1),include_bytes!("shaders/main/ReSTIRGI/ReSTIRGIKernel.spv").to_vec()),
+        (("ReSTIRGI","ReSTIRGISpatial",2),include_bytes!("shaders/main/ReSTIRGI/ReSTIRGISpatial.spv").to_vec()),
+        (("ReSTIRGI","ReSTIRGISpatial2",3),include_bytes!("shaders/main/ReSTIRGI/ReSTIRGISpatial2.spv").to_vec()),
+        (("BVHRefitter","BLASLightRefitKernel",1),include_bytes!("shaders/Utility/BVHRefitter/BLASLightRefitKernel.spv").to_vec()),
+        (("BVHRefitter","BLASSGTreeRefitKernel",2),include_bytes!("shaders/Utility/BVHRefitter/BLASSGTreeRefitKernel.spv").to_vec()),
+        (("BVHRefitter","Construct",3),include_bytes!("shaders/Utility/BVHRefitter/Construct.spv").to_vec()),
+        (("BVHRefitter","RefitBVHLayer",4),include_bytes!("shaders/Utility/BVHRefitter/RefitBVHLayer.spv").to_vec()),
+        (("BVHRefitter","RefitLayer",5),include_bytes!("shaders/Utility/BVHRefitter/RefitLayer.spv").to_vec()),
+        (("BVHRefitter","TLASLightBVHRefitKernel",6),include_bytes!("shaders/Utility/BVHRefitter/TLASLightBVHRefitKernel.spv").to_vec()),
+        (("BVHRefitter","TLASSGTreeRefitKernel",7),include_bytes!("shaders/Utility/BVHRefitter/TLASSGTreeRefitKernel.spv").to_vec()),
+        (("BVHRefitter","TransferKernel",8),include_bytes!("shaders/Utility/BVHRefitter/TransferKernel.spv").to_vec()),
+        (("BVHRefitter","UpdateGlobalBufferAABBKernel",9),include_bytes!("shaders/Utility/BVHRefitter/UpdateGlobalBufferAABBKernel.spv").to_vec()),
+        (("CopyTextureShader","BC4Kernel",1),include_bytes!("shaders/Utility/CopyTextureShader/BC4Kernel.spv").to_vec()),
+        (("CopyTextureShader","BC5Kernel",2),include_bytes!("shaders/Utility/CopyTextureShader/BC5Kernel.spv").to_vec()),
+        (("CopyTextureShader","Compress",3),include_bytes!("shaders/Utility/CopyTextureShader/Compress.spv").to_vec()),
+        (("CopyTextureShader","FullKernel",4),include_bytes!("shaders/Utility/CopyTextureShader/FullKernel.spv").to_vec()),
+        (("CopyTextureShader","FullKernelSplit",5),include_bytes!("shaders/Utility/CopyTextureShader/FullKernelSplit.spv").to_vec()),
+        (("CopyTextureShader","HeightmapCompressKernel",6),include_bytes!("shaders/Utility/CopyTextureShader/HeightmapCompressKernel.spv").to_vec()),
+        (("CopyTextureShader","NormalMapKernel",7),include_bytes!("shaders/Utility/CopyTextureShader/NormalMapKernel.spv").to_vec()),
+        (("CopyTextureShader","SingleChannelKernel",8),include_bytes!("shaders/Utility/CopyTextureShader/SingleChannelKernel.spv").to_vec()),
+        (("GeneralMeshFunctions","CombineLightBuffers",1),include_bytes!("shaders/Utility/GeneralMeshFunctions/CombineLightBuffers.spv").to_vec()),
+        (("GeneralMeshFunctions","CombineLightNodes",2),include_bytes!("shaders/Utility/GeneralMeshFunctions/CombineLightNodes.spv").to_vec()),
+        (("GeneralMeshFunctions","CombineNodeBuffers",3),include_bytes!("shaders/Utility/GeneralMeshFunctions/CombineNodeBuffers.spv").to_vec()),
+        (("GeneralMeshFunctions","CombineSGTreeNodes",4),include_bytes!("shaders/Utility/GeneralMeshFunctions/CombineSGTreeNodes.spv").to_vec()),
+        (("GeneralMeshFunctions","CombineTriBuffers",5),include_bytes!("shaders/Utility/GeneralMeshFunctions/CombineTriBuffers.spv").to_vec()),
     ]);
     println!("Hello from init!");
-    KERNELS.get_mut().replace(Kernels {
-        intersection_kernels: KernelStruct {
+    KERNELS.get_mut().replace(Box::leak(Box::new(Kernels {
+        intersection_kernels: Some(KernelStruct {
             kernel_name_and_name_to_binding: HashMap::new(),
             kernel_to_bgl_and_shader_mod: HashMap::new(),
-            kernel_name_and_name_to_globals_offset: HashMap::new(),
-        },
-        raygen_kernels: KernelStruct {
+            name_to_globals_offset: HashMap::new(),
+            kernel_index_to_name: HashMap::new(),
+            globals: Vec::new(),
+        }),
+        raygen_kernels: Some(KernelStruct {
             kernel_name_and_name_to_binding: HashMap::new(),
             kernel_to_bgl_and_shader_mod: HashMap::new(),
-            kernel_name_and_name_to_globals_offset: HashMap::new(),
-        },
-        ray_tracing_shader: KernelStruct {
+            name_to_globals_offset: HashMap::new(),
+            kernel_index_to_name: HashMap::new(),
+            globals: Vec::new(),
+        }),
+        ray_tracing_shader: Some(KernelStruct {
             kernel_name_and_name_to_binding: HashMap::new(),
             kernel_to_bgl_and_shader_mod: HashMap::new(),
-            kernel_name_and_name_to_globals_offset: HashMap::new(),
-        },
-        restir_gi: KernelStruct {
+            name_to_globals_offset: HashMap::new(),
+            kernel_index_to_name: HashMap::new(),
+globals: Vec::new(),
+        }),
+        restir_gi: Some(KernelStruct {
             kernel_name_and_name_to_binding: HashMap::new(),
             kernel_to_bgl_and_shader_mod: HashMap::new(),
-            kernel_name_and_name_to_globals_offset: HashMap::new(),
-        },
-    });
+            name_to_globals_offset: HashMap::new(),
+            kernel_index_to_name: HashMap::new(),
+            globals: Vec::new(),
+        }),
+        bvh_refitter: Some(KernelStruct {
+            kernel_name_and_name_to_binding: HashMap::new(),
+            kernel_to_bgl_and_shader_mod: HashMap::new(),
+            name_to_globals_offset: HashMap::new(),
+            kernel_index_to_name: HashMap::new(),
+            globals: Vec::new(),
+        }),
+        copy_texture_shader: Some(KernelStruct {
+            kernel_name_and_name_to_binding: HashMap::new(),
+            kernel_to_bgl_and_shader_mod: HashMap::new(),
+            name_to_globals_offset: HashMap::new(),
+            kernel_index_to_name: HashMap::new(),
+            globals: Vec::new(),
+        }),
+        general_mesh_functions: Some(KernelStruct {
+            kernel_name_and_name_to_binding: HashMap::new(),
+            kernel_to_bgl_and_shader_mod: HashMap::new(),
+            name_to_globals_offset: HashMap::new(),
+            kernel_index_to_name: HashMap::new(),
+            globals: Vec::new(),
+        }),
+    })));
     let mut binding = DEVICE.get_mut();
     let (device,queue) = binding.as_mut().unwrap();
-    for ((group,kernel), mut shader) in shaders.clone() {
+    for ((group,kernel,index), mut shader) in shaders.clone() {
         let mut binding = KERNELS.get_mut();
-        let kernels_struct = binding.as_mut().unwrap();
+        let kernels_struct = &mut **binding.as_mut().unwrap();
         let cap = shader.capacity();
         let len = shader.len();
         let ptr = shader.as_mut_ptr();
@@ -107,18 +159,25 @@ pub extern "C" fn init() {
        // println!("shader_mod: {:#?}",shader_mod);
         let mut global_binding: u32 = 0;
         let kernel_struct = match group {
-            "IntersectionKernels" => &mut kernels_struct.intersection_kernels,
-            "RayGenKernels" => &mut kernels_struct.raygen_kernels,
-            "RayTracingShader" => &mut kernels_struct.ray_tracing_shader,
-            "ReSTIRGI" => &mut kernels_struct.restir_gi,
+            "IntersectionKernels" => kernels_struct.intersection_kernels.as_mut().unwrap(),
+            "RayGenKernels" => kernels_struct.raygen_kernels.as_mut().unwrap(),
+            "RayTracingShader" => kernels_struct.ray_tracing_shader.as_mut().unwrap(),
+            "ReSTIRGI" => kernels_struct.restir_gi.as_mut().unwrap(),
+            "BVHRefitter" => kernels_struct.bvh_refitter.as_mut().unwrap(),
+            "CopyTextureShader" => kernels_struct.copy_texture_shader.as_mut().unwrap(),
+            "GeneralMeshFunctions" => kernels_struct.general_mesh_functions.as_mut().unwrap(),
             _ => unreachable!()
         };
+        kernel_struct.kernel_index_to_name.insert(index,String::from(kernel));
         for reflect_binding in bindings {
             if reflect_binding.name == "$Globals" {
                 global_binding = reflect_binding.binding;
               //  println!("$Global has {:#?} members",reflect_binding.block.members.len());
                 for member in reflect_binding.block.members {
-                    kernel_struct.kernel_name_and_name_to_globals_offset.insert((String::from(kernel), member.name.clone()), member.offset);
+                    kernel_struct.name_to_globals_offset.insert(member.name.clone(), member.offset);
+                    for _ in 0..member.size {
+                        kernel_struct.globals.push(0);
+                    }
                 }
             }
             entries.push(BindGroupLayoutEntry {

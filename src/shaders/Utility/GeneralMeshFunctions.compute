@@ -1,0 +1,127 @@
+#include "../GlobalDefines.cginc"
+#include "../main/CommonStructs.cginc"
+
+#pragma kernel CombineTriBuffers
+
+struct CudaTriangle {
+	float3 pos0;
+	float3 posedge1;
+	float3 posedge2;
+
+	uint3 norms;
+
+	uint3 tans;
+
+	uint tex0;
+	uint texedge1;
+	uint texedge2;
+
+	uint VertColA;
+	uint VertColB;
+	uint VertColC;
+
+	uint MatDat;
+
+	uint IsEmissive;
+};
+
+
+RWStructuredBuffer<CudaTriangleA> OutCudaTriArrayA;
+RWStructuredBuffer<CudaTriangleB> OutCudaTriArrayB;
+
+StructuredBuffer<CudaTriangle> InCudaTriArray;
+
+uint Offset;
+uint Count;
+
+[numthreads(372, 1, 1)]
+void CombineTriBuffers(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= Count)
+		return;
+
+	OutCudaTriArrayA[id.x + Offset].pos0 = InCudaTriArray[id.x].pos0;
+	OutCudaTriArrayA[id.x + Offset].posedge1 = InCudaTriArray[id.x].posedge1;
+	OutCudaTriArrayA[id.x + Offset].posedge2 = InCudaTriArray[id.x].posedge2;
+	OutCudaTriArrayA[id.x + Offset].tex0 = InCudaTriArray[id.x].tex0;
+	OutCudaTriArrayA[id.x + Offset].texedge1 = InCudaTriArray[id.x].texedge1;
+	OutCudaTriArrayA[id.x + Offset].texedge2 = InCudaTriArray[id.x].texedge2;
+	OutCudaTriArrayA[id.x + Offset].MatDat = InCudaTriArray[id.x].MatDat;
+
+	OutCudaTriArrayB[id.x + Offset].norms = InCudaTriArray[id.x].norms;
+	OutCudaTriArrayB[id.x + Offset].tans = InCudaTriArray[id.x].tans;
+	OutCudaTriArrayB[id.x + Offset].VertColA = InCudaTriArray[id.x].VertColA;
+	OutCudaTriArrayB[id.x + Offset].VertColB = InCudaTriArray[id.x].VertColB;
+	OutCudaTriArrayB[id.x + Offset].VertColC = InCudaTriArray[id.x].VertColC;
+	OutCudaTriArrayB[id.x + Offset].IsEmissive = InCudaTriArray[id.x].IsEmissive;
+
+}
+
+
+
+#pragma kernel CombineNodeBuffers
+
+RWStructuredBuffer<BVHNode8Data> OutAggNodes;
+
+StructuredBuffer<BVHNode8Data> InAggNodes;
+
+[numthreads(372, 1, 1)]
+void CombineNodeBuffers(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= Count)
+		return;
+
+	OutAggNodes[id.x + Offset] = InAggNodes[id.x];
+
+}
+
+#pragma kernel CombineLightBuffers
+
+StructuredBuffer<LightTriData> LightTrianglesIn;
+RWStructuredBuffer<LightTriData> LightTrianglesOut;
+
+[numthreads(372, 1, 1)]
+void CombineLightBuffers(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= Count)
+		return;
+
+	LightTrianglesOut[id.x + Offset] = LightTrianglesIn[id.x];
+
+}
+
+
+
+#pragma kernel CombineLightNodes
+
+StructuredBuffer<LightBVHData> LightNodesIn;
+RWStructuredBuffer<LightBVHData> LightNodesOut;
+RWStructuredBuffer<LightBVHData> LightNodesOut2;
+
+[numthreads(372, 1, 1)]
+void CombineLightNodes(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= Count)
+		return;
+
+	LightNodesOut[id.x + Offset] = LightNodesIn[id.x];
+	LightNodesOut2[id.x + Offset] = LightNodesIn[id.x];
+
+}
+
+#pragma kernel CombineSGTreeNodes
+
+StructuredBuffer<GaussianTreeNode> SGNodesIn;
+RWStructuredBuffer<GaussianTreeNode> SGNodesOut;
+RWStructuredBuffer<GaussianTreeNode> SGNodesOut2;
+
+[numthreads(372, 1, 1)]
+void CombineSGTreeNodes(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= Count)
+		return;
+
+	SGNodesOut[id.x + Offset] = SGNodesIn[id.x];
+	SGNodesOut2[id.x + Offset] = SGNodesIn[id.x];
+
+}
